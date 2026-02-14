@@ -1,9 +1,11 @@
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 import sqlite3
 from datetime import datetime
 import random
 import os
+from openpyxl import Workbook, load_workbook
+from io import BytesIO
 
 app = Flask(__name__)
 CORS(app)
@@ -232,22 +234,35 @@ def delete_character(character_id):
 
 @app.route('/api/characters/random', methods=['GET'])
 def get_random_character():
-    """获取随机的待学习汉字（未掌握的）"""
+    """获取随机的待学习汉字（默认未掌握的，复习模式获取已掌握的）"""
+    mastered = request.args.get('mastered', 'false').lower() == 'true'
+
     db = get_db()
     cursor = db.cursor()
-    
-    cursor.execute('''
-        SELECT id, character, recognition_count, is_mastered
-        FROM characters
-        WHERE is_mastered = 0
-    ''')
-    
+
+    if mastered:
+        # 复习模式：获取已掌握的汉字
+        cursor.execute('''
+            SELECT id, character, recognition_count, is_mastered
+            FROM characters
+            WHERE is_mastered = 1
+        ''')
+        message = '没有已掌握的汉字可复习'
+    else:
+        # 学习模式：获取未掌握的汉字
+        cursor.execute('''
+            SELECT id, character, recognition_count, is_mastered
+            FROM characters
+            WHERE is_mastered = 0
+        ''')
+        message = '恭喜！所有汉字都已掌握'
+
     characters = [dict(row) for row in cursor.fetchall()]
     db.close()
-    
+
     if not characters:
-        return jsonify({'message': '恭喜！所有汉字都已掌握'}), 200
-    
+        return jsonify({'message': message}), 200
+
     # 随机选择一个
     random_char = random.choice(characters)
     return jsonify(random_char)
@@ -435,12 +450,174 @@ def get_mistakes():
     
     return jsonify(mistakes)
 
+@app.route('/api/characters/export', methods=['GET'])
+def export_characters_excel():
+    """导出汉字库到Excel文件"""
+    db = get_db()
+    cursor = db.cursor()
+
+    cursor.execute('''
+        SELECT id, character, pinyin, definition, words, sentences,
+               recognition_count, is_mastered, created_at, updated_at
+        FROM characters
+        ORDER BY character
+    ''')
+
+    characters = cursor.fetchall()
+    db.close()
+
+    # 创建Excel工作簿
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "汉字库"
+
+    # 设置表头
+    headers = ['汉字', '拼音', '释义', '组词', '造句', '认识次数', '是否已掌握', '创建时间', '更新时间']
+    ws.append(headers)
+
+    # 设置表头样式
+    from openpyxl.styles import Font, PatternFill, Alignment
+    header_fill = PatternFill(start_color="4F81BD", end_color="4F81BD", fill_type="solid")
+    header_font = Font(bold=True, color="FFFFFF")
+
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal='center', vertical='center')
+
+    # 写入数据
+    for char in characters:
+        ws.append([
+            char['character'],
+            char['pinyin'] or '',
+            char['definition'] or '',
+            char['words'] or '',
+            char['sentences'] or '',
+            char['recognition_count'],
+            '是' if char['is_mastered'] else '否',
+            char['created_at'],
+            char['updated_at']
+        ])
+
+    # 调整列宽
+    ws.column_dimensions['A'].width = 8  # 汉字
+    ws.column_dimensions['B'].width = 15  # 拼音
+    ws.column_dimensions['C'].width = 30  # 释义
+    ws.column_dimensions['D'].width = 40  # 组词
+    ws.column_dimensions['E'].width = 50  # 造句
+    ws.column_dimensions['F'].width = 10  # 认识次数
+    ws.column_dimensions['G'].width = 12  # 是否已掌握
+    ws.column_dimensions['H'].width = 20  # 创建时间
+    ws.column_dimensions['I'].width = 20  # 更新时间
+
+    # 保存到内存
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+
+    # 生成文件名（包含时间戳）
+    filename = f"汉字库导出_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+
+    return send_file(
+        output,
+        as_attachment=True,
+        download_name=filename,
+        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    )
+
+@app.route('/api/characters/import', methods=['POST'])
+def import_characters_excel():
+    """从Excel文件导入汉字库"""
+    if 'file' not in request.files:
+        return jsonify({'error': '请上传Excel文件'}), 400
+
+    file = request.files['file']
+
+    if file.filename == '':
+        return jsonify({'error': '请上传Excel文件'}), 400
+
+    if not file.filename.endswith(('.xlsx', '.xls')):
+        return jsonify({'error': '请上传Excel文件格式'}), 400
+
+    try:
+        # 加载Excel文件
+        wb = load_workbook(filename=file)
+        ws = wb.active
+
+        db = get_db()
+        cursor = db.cursor()
+
+        success_count = 0
+        update_count = 0
+        skip_count = 0
+        error_list = []
+
+        # 跳过表头，从第二行开始
+        for idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+            if not row or not row[0]:
+                continue
+
+            try:
+                # 解析行数据
+                # 格式: [汉字, 拼音, 释义, 组词, 造句, 认识次数, 是否已掌握, 创建时间, 更新时间]
+                character = str(row[0]).strip()
+
+                if not character:
+                    continue
+
+                pinyin = str(row[1]).strip() if len(row) > 1 and row[1] else None
+                definition = str(row[2]).strip() if len(row) > 2 and row[2] else None
+                words = str(row[3]).strip() if len(row) > 3 and row[3] else None
+                sentences = str(row[4]).strip() if len(row) > 4 and row[4] else None
+                recognition_count = int(row[5]) if len(row) > 5 and row[5] is not None else 0
+                is_mastered_str = str(row[6]).strip() if len(row) > 6 and row[6] else '否'
+                is_mastered = 1 if is_mastered_str in ['是', 'Yes', 'TRUE', '1', 'true'] else 0
+
+                # 检查汉字是否存在
+                cursor.execute('SELECT id FROM characters WHERE character = ?', (character,))
+                existing = cursor.fetchone()
+
+                if existing:
+                    # 更新现有汉字
+                    cursor.execute('''
+                        UPDATE characters
+                        SET pinyin = ?, definition = ?, words = ?, sentences = ?,
+                            recognition_count = ?, is_mastered = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                    ''', (pinyin, definition, words, sentences, recognition_count, is_mastered, existing['id']))
+                    update_count += 1
+                else:
+                    # 插入新汉字
+                    cursor.execute('''
+                        INSERT INTO characters
+                        (character, pinyin, definition, words, sentences, recognition_count, is_mastered)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ''', (character, pinyin, definition, words, sentences, recognition_count, is_mastered))
+                    success_count += 1
+
+            except Exception as e:
+                skip_count += 1
+                error_list.append(f'第{idx}行: {str(e)}')
+
+        db.commit()
+        db.close()
+
+        return jsonify({
+            'success': success_count,
+            'updated': update_count,
+            'skipped': skip_count,
+            'errors': error_list[:10]  # 只返回前10个错误
+        }), 201
+
+    except Exception as e:
+        return jsonify({'error': f'文件处理失败: {str(e)}'}), 400
+
 if __name__ == '__main__':
     # 初始化数据库
     if not os.path.exists(DATABASE):
         init_db()
         print('数据库初始化完成！')
-    
+
     print('后端服务启动在 http://localhost:5000')
     print('局域网访问地址：http://<本机IP>:5000')
     app.run(debug=True, host='0.0.0.0', port=5000)

@@ -5,6 +5,7 @@ backend/*.pyo
 backend/.env
 backend/venv/
 backend/env/
+backend/*.db
 
 # Frontend
 node_modules/
